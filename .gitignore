@@ -1,1 +1,3 @@
-.vs
+/build/
+!/build/PresentBarrierTest.vcxproj
+!/build/PresentBarrierTest.sln
