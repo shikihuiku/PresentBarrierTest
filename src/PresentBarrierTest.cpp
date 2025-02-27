@@ -222,6 +222,8 @@ public:
             uint32_t    outputIdx{};
             std::string description;
 
+            float       presentWaitMs{};
+
 #ifdef NVAPI_ENABLED
             NV_PRESENT_BARRIER_FRAME_STATISTICS nvapi_PBStats{};
             PresentBarrierMode                  nvapi_PresentBarrierMode{ PresentBarrierMode::leave };
@@ -229,7 +231,7 @@ public:
         };
 
         std::vector<Display> displays;
-        uint64_t globalFrameCounter{};
+        uint64_t globalCounter{};
     } ctx;
 
     class Adapter final
@@ -486,7 +488,7 @@ protected:
     bool   swapChainOccluded{ false };
     HANDLE swapChainWaitableObject{};
 
-    std::array<uint32_t, 2> currentSwapchainSize{ 0, 0 };
+    std::array<uint32_t, 2> currentSwapchainSize{ (uint32_t)-1, (uint32_t)-1};
     RECT                    storedWindowPosition{};
 
     class ShaderAssets {
@@ -980,7 +982,8 @@ public:
                     Log("Changing Window Mode - update swap chain.\n");
                     {
                         RECT rc{};
-                        assert(GetClientRect(hWnd, &rc));
+                        BOOL sts = GetClientRect(hWnd, &rc);
+                        assert(sts);
                         if (!CreateSwapChain(hWnd, rc.right, rc.bottom)) {
                             Log(L"Failed to resize/create swap chain after changing window mode.\n");
                             return false;
@@ -993,8 +996,12 @@ public:
                         swapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
                         assert(SUCCEEDED(hr));
                     }
-                    assert(SUCCEEDED(queue->Signal(fence.Get(), ++fenceLastSignaledValue)));
-                    assert(WaitForLastPresent());
+                    {
+                        HRESULT hr = queue->Signal(fence.Get(), ++fenceLastSignaledValue);
+                        assert(SUCCEEDED(hr));
+                        bool sts = WaitForLastPresent();
+                        assert(sts);
+                    }
 
                     currentWindowMode = requestedWindowMode;
                     Log("Changing Window Mode - Finished.\n");
@@ -1005,7 +1012,8 @@ public:
             if (currentWindowMode == WindowMode::fullSceen) {
                 // Check fullscreen state.
                 BOOL sts{ FALSE };
-                assert(SUCCEEDED(swapChain->GetFullscreenState(&sts, nullptr)));
+                HRESULT hr = swapChain->GetFullscreenState(&sts, nullptr);
+                assert(SUCCEEDED(hr));
 
                 if (!sts) {
                     // Full screen has been finished for somereason. (alt tabbing or something..)
@@ -1016,7 +1024,10 @@ public:
         }
 
         RECT rc{};
-        assert(GetClientRect(hWnd, &rc));
+        {
+            BOOL sts= GetClientRect(hWnd, &rc);
+            assert(sts);
+        }
 
         // Check client rect size.
         if (currentSwapchainSize[0] != rc.right || currentSwapchainSize[1] != rc.bottom) {
@@ -1041,9 +1052,26 @@ public:
                 assert(sts);
                 HRESULT hr = fence->SetEventOnCompletion(fenceLastSignaledValue - (NUM_BACK_BUFFERS - 1), fenceEvent);
                 assert(SUCCEEDED(hr));
-                DWORD dwSts = WaitForSingleObject(fenceEvent, INFINITE);
-                if (dwSts != WAIT_OBJECT_0)
-                    return false;
+                for (;;) {
+                    DWORD dwSts = WaitForSingleObject(fenceEvent, 2000); // 2sec..
+                    if (dwSts == WAIT_OBJECT_0) {
+                        break;
+                    }
+                    if (dwSts != WAIT_TIMEOUT) {
+                        Log(L"An error detected while waiting for a fence.\n");
+                        return false;
+                    }
+                    Log(L"Present lock detected. Waited for more than 2 seconds.");
+#ifdef NVAPI_ENABLED
+                    if (nvapi_PresentBarrierHasJoined) {
+                        std::scoped_lock<std::mutex> l{ app->mtx };
+                        if (NvAPI_LeavePresentBarrier(nvapi_PresentBarrierClientHandle) != NVAPI_OK) {
+                            Log("Failed to leave from the Present Barrier.\n");
+                        }
+                        nvapi_PresentBarrierHasJoined = false;
+                    }
+#endif
+                }
             }
         }
 
@@ -1116,7 +1144,8 @@ public:
         }
 
         if (shaderAssets) {
-            assert(shaderAssets->Terminate());
+            bool sts = shaderAssets->Terminate();
+            assert(sts);
             shaderAssets.reset();
         }
 
@@ -1321,7 +1350,8 @@ protected:
     HINSTANCE hInst{};
     HWND hWnd{};
     std::thread thd{};
-    std::binary_semaphore semaphore{ 1 };
+    std::binary_semaphore semaphore{ 0 };
+    bool joinable{ false };
     std::array<LONG_PTR, 2> defaultWindowStyle{0, 0};
 
     virtual const std::wstring_view& WindowClassName() = 0;
@@ -1384,8 +1414,6 @@ public:
 
     bool Init(HINSTANCE hInstance, std::shared_ptr<App>& inApp, const uint32_t listIdx, const bool withImGui)
     {
-        semaphore.acquire();
-
         hInst = hInstance;
 
         if (!RegisterWindowClass(hInstance)) {
@@ -1415,14 +1443,15 @@ public:
                 MSG msg;
                 PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
 
-                D3DContext_ImGuiBase* d3dctx = GetD3DContext_ImGuiBase();
+                // This is a pointer, but it points a member's instance.
+                D3DContext_ImGuiBase *d3dctx = GetD3DContext_ImGuiBase();
 
                 // Set the app and associated output.
                 d3dctx->SetApp(inApp, listIdx);
 
                 hWnd = CreateWindowExW(0, WindowClassName().data(), wname.c_str(),
                     WS_OVERLAPPEDWINDOW,
-                    CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, (void*)&d3dctx);
+                    CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, (void*)d3dctx);
                 if (!hWnd)
                 {
                     Log(L"Failed to create a window.");
@@ -1446,7 +1475,7 @@ public:
                     return 0;
                 }
 
-                // Release the main thread.
+                // Release the semaphore. Unblocking the main thread.
                 semaphore.release();
 
                 // Main Loop for the window.
@@ -1483,12 +1512,15 @@ public:
                     return 0;
                 }
 
+                // Release the semaphore to tell the Window has been finished.
+                semaphore.release();
+
                 Log(L"Thread:%s - Join\n", wname.c_str());
                 return (int)msg.wParam;
             });
 
+        // Wait untile the worker thread has been established.
         semaphore.acquire();
-        semaphore.release();
 
         return true;
     }
@@ -1496,6 +1528,16 @@ public:
     void WaitForFinished()
     {
         thd.join();
+    }
+
+    bool Joinable()
+    {
+        if (!joinable) {
+            if (semaphore.try_acquire())
+                joinable = true;
+        }
+
+        return joinable;
     }
 
     bool Terminate()
@@ -1642,7 +1684,8 @@ protected:
             {
                 if (!shaderAssets) {
                     shaderAssets = std::make_unique<ShaderAssets>();
-                    assert(shaderAssets->Init(dev));
+                    bool sts = shaderAssets->Init(dev);
+                    assert(sts);
                 }
 
                 auto [ptr, gpuPtr, size] = shaderAssets->GetUploadChunk();
@@ -1659,7 +1702,7 @@ protected:
 
                 {
                     std::scoped_lock<std::mutex> l{ app->mtx };
-                    linePos = 1.0f - float(app->ctx.globalFrameCounter % 256) / 128.f;
+                    linePos = 1.0f - float(app->ctx.globalCounter % 256) / 128.f;
                 }
 
                 std::array<float, 4> col{ 0.f, 1.f, 1.f, 1.f };
@@ -1698,8 +1741,7 @@ protected:
 
                     ImGui::Begin("Window Mode");
 
-                    static int fidx;
-                    ImGui::Text("Frame %d", ++fidx);
+                    ImGui::Text("Global Counter: %d", app->ctx.globalCounter);
 
                     uint32_t idx{};
                     for (auto& d : app->ctx.displays) {
@@ -1746,6 +1788,8 @@ protected:
                             d.windowMode = WindowMode::windowed;
                         }
 
+                        ImGui::SliderFloat("PresentWait(ms)", &d.presentWaitMs, 0.0f, 1000.0f);
+
 #ifdef NVAPI_ENABLED
                         if (ImGui::Button("Join PresentBarrier")) {
                             d.nvapi_PresentBarrierMode = PresentBarrierMode::join;
@@ -1783,16 +1827,27 @@ protected:
 
             // read app's states - for all windows.
             {
-                std::scoped_lock<std::mutex> l{ app->mtx };
+                App::Context::Mode  appMode{};
+                WindowMode          wMode{};
+                float               waitMs{};
+                {
+                    std::scoped_lock<std::mutex> l{ app->mtx };
 
-                // primary window only.
-                if (imInitialized) {
-                    app->ctx.globalFrameCounter++;
+                    appMode = app->ctx.mode;
+
+                    auto& d = app->ctx.displays.at(appListIdx);
+                    wMode = d.windowMode;
+                    waitMs = d.presentWaitMs;
+
                 }
 
-                requestedWindowMode = app->ctx.displays.at(appListIdx).windowMode;
+                if (waitMs > 0.f) {
+                    Sleep((DWORD)waitMs);
+                }
 
-                if (app->ctx.mode != App::Context::Mode::test) {
+                requestedWindowMode = wMode;
+
+                if (appMode != App::Context::Mode::test) {
                     PostMessageW(hWnd, WM_CLOSE, 0, 0);
                 }
             }
@@ -1878,12 +1933,27 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                 windows.push_back(std::move(w));
                 withImGui = false;
             }
-            if (app->ctx.mode == App::Context::Mode::test) {
-                for (auto& w : windows)
-                    w->WaitForFinished();
+            for (;;) {
+                bool allJoinable{ true };
+                for (auto& w : windows) {
+                    allJoinable &= w->Joinable();
+                }
+                if (allJoinable)
+                    break;
+                {
+                    std::scoped_lock<std::mutex> l{ app->mtx };
+                    app->ctx.globalCounter++;
+                }
+                Sleep(5);
+            }
+            for (auto& w : windows) {
+                w->WaitForFinished();
             }
         }
-        app->ctx.mode = App::Context::Mode::exit;
+        {
+            std::scoped_lock<std::mutex> l{ app->mtx };
+            app->ctx.mode = App::Context::Mode::exit;
+        }
     }
 
     app->Terminate();

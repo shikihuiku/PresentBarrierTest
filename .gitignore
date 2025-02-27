@@ -1,7 +1,5 @@
 /build/
 !/build/PresentBarrierTest.vcxproj
 !/build/PresentBarrierTest.sln
-/NVAPI/
-!/NVAPI/README.md
 /src/shaders/*.cso
 
