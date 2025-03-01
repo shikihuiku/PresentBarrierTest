@@ -12,8 +12,8 @@
 #include <mutex>
 #include <algorithm>
 #include <span>
-
-#include "PresentBarrierTest.h"
+#include <chrono>
+#include <functional>
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -222,7 +222,7 @@ public:
             uint32_t    outputIdx{};
             std::string description;
 
-            float       presentWaitMs{};
+            float       threadWaitMs{};
 
 #ifdef NVAPI_ENABLED
             NV_PRESENT_BARRIER_FRAME_STATISTICS nvapi_PBStats{};
@@ -457,6 +457,13 @@ public:
 
 class D3DContext_Base
 {
+public:
+    enum class WindowModeTransitionStatus {
+        inProgress,
+        completed,
+        error
+    };
+
 protected:
     static constexpr size_t NUM_BACK_BUFFERS{ 2 };
     static constexpr size_t DESC_HEAP_SIZE{ 256 };
@@ -464,30 +471,30 @@ protected:
     WindowMode currentWindowMode{ WindowMode::windowed };
     WindowMode requestedWindowMode{ WindowMode::windowed };
     WindowMode setWindowMode{ WindowMode::windowed };
+    bool       internalWindowModeChange{ false };
 
     std::shared_ptr<App>    app;
     uint32_t                appListIdx{};
 
     ComPtr<IDXGIFactory7>   factory;
     ComPtr<ID3D12Device>    dev;
-    ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGIOutput6>    output;
     DXGI_OUTPUT_DESC        outputDesc{};
+    ComPtr<ID3D12CommandQueue>          queue;
+    ComPtr<ID3D12GraphicsCommandList>   cList;
 
-    std::array<ComPtr<ID3D12DescriptorHeap>, NUM_BACK_BUFFERS> rtvDescHeap;
-    std::array<ComPtr<ID3D12DescriptorHeap>, NUM_BACK_BUFFERS> descHeap;
+    std::array<ComPtr<ID3D12DescriptorHeap>, NUM_BACK_BUFFERS>   rtvDescHeap;
+    std::array<ComPtr<ID3D12DescriptorHeap>, NUM_BACK_BUFFERS>   descHeap;
     std::array<ComPtr<ID3D12CommandAllocator>, NUM_BACK_BUFFERS> cAllocator;
-    ComPtr<ID3D12GraphicsCommandList> cList;
 
     ComPtr<ID3D12Fence> fence;
-    HANDLE fenceEvent{};
-    UINT64 fenceLastSignaledValue{};
+    HANDLE      fenceEvent{};
+    uint64_t    fenceLastSignaledValue{};
 
     ComPtr<IDXGISwapChain3> swapChain;
     std::array<ComPtr<ID3D12Resource>, NUM_BACK_BUFFERS>  backbuffers;
     bool   swapChainOccluded{ false };
     HANDLE swapChainWaitableObject{};
-
     std::array<uint32_t, 2> currentSwapchainSize{ (uint32_t)-1, (uint32_t)-1};
     RECT                    storedWindowPosition{};
 
@@ -735,10 +742,44 @@ public:
         return true;
     }
 
+    DWORD WaitForFence(bool leavePresentBarrier = true, uint64_t behind = 0, DWORD waitMs = INFINITE)
+    {
+        if (leavePresentBarrier) {
+#ifdef NVAPI_ENABLED
+            // Leave from the present barrier before taking a GPU CPU sync.
+            if (nvapi_PresentBarrierHasJoined) {
+                std::scoped_lock<std::mutex> l{ app->mtx };
+                if (NvAPI_LeavePresentBarrier(nvapi_PresentBarrierClientHandle) != NVAPI_OK) {
+                    Log("Failed to leave from the Present Barrier.\n");
+                    return WAIT_FAILED;
+                }
+                nvapi_PresentBarrierHasJoined = false;
+            }
+#endif
+        }
+
+        if (fenceLastSignaledValue == 0 || fenceLastSignaledValue <= behind)
+            return WAIT_OBJECT_0;
+        uint64_t targetValue = fenceLastSignaledValue - behind;
+        if (fence->GetCompletedValue() >= targetValue)
+            return WAIT_OBJECT_0;
+
+        if (!ResetEvent(fenceEvent)) {
+            Log("Failed to reset event.\n");
+            return WAIT_FAILED;
+        };
+        if (FAILED(fence->SetEventOnCompletion(targetValue, fenceEvent))) {
+            Log("Failed to SetEventOnCompletion.\n");
+            return WAIT_FAILED;
+        };
+
+        return WaitForSingleObject(fenceEvent, waitMs);
+    }
+
     bool CreateSwapChain(HWND hWnd, uint32_t width, uint32_t height)
     {
         // take GPU-CPU sync
-        if (!WaitForLastPresent())
+        if (WaitForFence() != WAIT_OBJECT_0)
             return false;
 
         // release all backbuffers.
@@ -870,8 +911,6 @@ public:
         return true;
     }
 
-    virtual void Render(HWND, ComPtr<ID3D12GraphicsCommandList> &) = 0;
-
     bool FullScreenStateTransition(BOOL fsState, IDXGIOutput* output = nullptr)
     {
         for (;;) {
@@ -898,181 +937,159 @@ public:
         return true;
     }
 
-    bool WaitForLastPresent()
+    WindowModeTransitionStatus WindowModeTransition(HWND hWnd, const std::tuple<LONG_PTR, LONG_PTR>& defaultWindowStyle)
     {
-#ifdef NVAPI_ENABLED
-        // Leave from the present barrier before taking a GPU CPU sync.
-        if (nvapi_PresentBarrierHasJoined) {
-            std::scoped_lock<std::mutex> l{ app->mtx };
-            if (NvAPI_LeavePresentBarrier(nvapi_PresentBarrierClientHandle) != NVAPI_OK) {
-                Log("Failed to leave from the Present Barrier.\n");
-            }
-            nvapi_PresentBarrierHasJoined = false;
-        }
-#endif
-
-        if (fenceLastSignaledValue == 0)
-            return true;
-        if (fence->GetCompletedValue() >= fenceLastSignaledValue)
-            return true;
-
-        BOOL sts = ResetEvent(fenceEvent);
-        assert(sts);
-        HRESULT hr = fence->SetEventOnCompletion(fenceLastSignaledValue, fenceEvent);
-        assert(SUCCEEDED(hr));
-        DWORD dwSts = WaitForSingleObject(fenceEvent, INFINITE);
-
-        return dwSts == WAIT_OBJECT_0 ? true : false;
-    }
-
-    bool Present(HWND hWnd, const std::array<LONG_PTR, 2>& defaultWindowStyle)
-    {
-        if (!dev)
-            return false;
-
-        // Window mode change only happens here.
-        if (swapChain) {
-            if (currentWindowMode != requestedWindowMode) {
-                if (!WaitForLastPresent())
-                    return false;
-
-                BOOL currentFsState = currentWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
-                BOOL requestedFsState = requestedWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
-                BOOL setFsState = setWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
-
-                if (requestedWindowMode != setWindowMode) {
-                    Log("Changing Window Mode - Start.\n");
-
-                    if (currentWindowMode == WindowMode::windowed) {
-                        WINDOWPLACEMENT pls{};
-                        GetWindowPlacement(hWnd, &pls);
-                        storedWindowPosition = pls.rcNormalPosition;
-                    }
-                    if (requestedFsState != setFsState) {
-                        Log("Changing full screen state to %s\n", requestedFsState ? "TRUE" : "FALSE");
-                        if (! FullScreenStateTransition(requestedFsState, requestedFsState ? output.Get() : nullptr)) {
-                            Log(L"Failed to set FullScreenSteate.\n");
-                            return false;
-                        }
-                    }
-                    // Window Stlye changes happen in window message pump. 
-                    if (requestedWindowMode == WindowMode::borderlessWindowed) {
-                        SetWindowLongPtrW(hWnd, GWL_STYLE, (LONG_PTR)WS_VISIBLE);
-                        ShowWindow(hWnd, SW_SHOWMAXIMIZED);
-                        UpdateWindow(hWnd);
-                    }
-                    else if (requestedWindowMode == WindowMode::windowed) {
-                        SetWindowLongPtrW(hWnd, GWL_STYLE, defaultWindowStyle[0]);
-                        SetWindowLongPtrW(hWnd, GWL_EXSTYLE, defaultWindowStyle[1]);
-
-                        const auto& rc{ storedWindowPosition };
-                        SetWindowPos(hWnd, nullptr, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER);
-                        ShowWindow(hWnd, SW_SHOWNORMAL);
-                        UpdateWindow(hWnd);
-                    }
-
-                    // Get back to Windows message pump once to process messages.
-                    setWindowMode = requestedWindowMode;
-                    return true;
-                }
-                else if (requestedWindowMode != currentWindowMode) {
-
-                    // FS <-> Windowed transition always requires resizing the swap chain.
-                    // Window style change always changes client rect size.
-                    Log("Changing Window Mode - update swap chain.\n");
-                    {
-                        RECT rc{};
-                        BOOL sts = GetClientRect(hWnd, &rc);
-                        assert(sts);
-                        if (!CreateSwapChain(hWnd, rc.right, rc.bottom)) {
-                            Log(L"Failed to resize/create swap chain after changing window mode.\n");
-                            return false;
-                        }
-                    }
-
-                    Log("Changing Window Mode - Calling Present.\n");
-                    {
-                        HRESULT hr = swapChain->Present(1, 0);
-                        swapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
-                        assert(SUCCEEDED(hr));
-                    }
-                    {
-                        HRESULT hr = queue->Signal(fence.Get(), ++fenceLastSignaledValue);
-                        assert(SUCCEEDED(hr));
-                        bool sts = WaitForLastPresent();
-                        assert(sts);
-                    }
-
-                    currentWindowMode = requestedWindowMode;
-                    Log("Changing Window Mode - Finished.\n");
-                }
-            }
-
-            // Always check while in fullscreen mode.
-            if (currentWindowMode == WindowMode::fullSceen) {
-                // Check fullscreen state.
-                BOOL sts{ FALSE };
-                HRESULT hr = swapChain->GetFullscreenState(&sts, nullptr);
-                assert(SUCCEEDED(hr));
-
-                if (!sts) {
-                    // Full screen has been finished for somereason. (alt tabbing or something..)
-                    requestedWindowMode = WindowMode::windowed;
-                    return true;
-                }
-            }
-        }
+        // Window mode change and swap chain modifications only happens here.
+        // This thread is called from the Windows message pump thread, not the render thread.
+        // Before entering this function, render thread need to be joined.
 
         RECT rc{};
-        {
-            BOOL sts= GetClientRect(hWnd, &rc);
-            assert(sts);
+        if (!GetClientRect(hWnd, &rc)) {
+            Log("Failed to get client rect.\n");
+            return WindowModeTransitionStatus::error;
         }
 
-        // Check client rect size.
-        if (currentSwapchainSize[0] != rc.right || currentSwapchainSize[1] != rc.bottom) {
+        // No window mode trasition.
+        if (currentWindowMode == requestedWindowMode) {
+            // Check the fullscreen status while in fullscreen mode.
+            if (swapChain) {
+                if (currentWindowMode == WindowMode::fullSceen) {
+                    BOOL sts{ FALSE };
+                    if (FAILED(swapChain->GetFullscreenState(&sts, nullptr))) {
+                        Log("Failed to get fullscreen state.\n");
+                        return WindowModeTransitionStatus::error;
+                    }
+                    if (!sts) {
+                        // Full screen has been finished for somereason. (alt tabbing or something..)
+                        requestedWindowMode = WindowMode::windowed;
+                        internalWindowModeChange = true; // Tell the app it's cahnged from the window.
+                    }
+                }
+            }
+
+            // Check the client rect update.
+            if (currentSwapchainSize[0] != rc.right || currentSwapchainSize[1] != rc.bottom) {
+                if (! CreateSwapChain(hWnd, rc.right, rc.bottom)) {
+                    Log("Failed to create swap chain.\n");
+                    return WindowModeTransitionStatus::error;
+                };
+            }
+        }
+        if (currentWindowMode == requestedWindowMode)
+            return WindowModeTransitionStatus::completed;
+
+        // Transition is happening.
+        // Take GPU <-> CPU sync.
+        if (WaitForFence() != WAIT_OBJECT_0) {
+            return WindowModeTransitionStatus::error;
+        }
+
+        BOOL currentFsState = currentWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
+        BOOL requestedFsState = requestedWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
+        BOOL setFsState = setWindowMode == WindowMode::fullSceen ? TRUE : FALSE;
+
+        if (requestedWindowMode != setWindowMode) {
+            Log("Changing Window Mode - Start.\n");
+
+            if (currentWindowMode == WindowMode::windowed) {
+                WINDOWPLACEMENT pls{};
+                GetWindowPlacement(hWnd, &pls);
+                storedWindowPosition = pls.rcNormalPosition;
+            }
+            if (requestedFsState != setFsState) {
+                Log("Changing full screen state to %s\n", requestedFsState ? "TRUE" : "FALSE");
+                if (!FullScreenStateTransition(requestedFsState, requestedFsState ? output.Get() : nullptr)) {
+                    Log(L"Failed to set FullScreenSteate.\n");
+                    return WindowModeTransitionStatus::error;
+                }
+            }
+
+            // Window Stlye changes happen in window message pump. 
+            if (requestedWindowMode == WindowMode::borderlessWindowed) {
+                SetWindowLongPtrW(hWnd, GWL_STYLE, (LONG_PTR)WS_VISIBLE);
+                ShowWindow(hWnd, SW_SHOWMAXIMIZED);
+                UpdateWindow(hWnd);
+            }
+            else if (requestedWindowMode == WindowMode::windowed) {
+                SetWindowLongPtrW(hWnd, GWL_STYLE, std::get<0>(defaultWindowStyle));
+                SetWindowLongPtrW(hWnd, GWL_EXSTYLE, std::get<1>(defaultWindowStyle));
+
+                const auto& rc{ storedWindowPosition };
+                SetWindowPos(hWnd, nullptr, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER);
+                ShowWindow(hWnd, SW_SHOWNORMAL);
+                UpdateWindow(hWnd);
+            }
+
+            // Get back to Windows message pump once to process messages.
+            setWindowMode = requestedWindowMode;
+            return WindowModeTransitionStatus::inProgress;
+        }
+        else if (requestedWindowMode != currentWindowMode) {
+            // FS <-> Windowed transition always requires resizing the swap chain.
+            // Window style change always changes client rect size.
+            Log("Changing Window Mode - update swap chain.\n");
             if (!CreateSwapChain(hWnd, rc.right, rc.bottom)) {
-                return false;
-            };
+                Log(L"Failed to resize/create swap chain after changing window mode.\n");
+                return WindowModeTransitionStatus::error;
+            }
+
+            Log("Changing Window Mode - Calling an empty Present.\n");
+            {
+                HRESULT hr = swapChain->Present(1, 0);
+                swapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+                if (FAILED(hr))
+                    return WindowModeTransitionStatus::error;
+            }
+            {
+                if (FAILED(queue->Signal(fence.Get(), ++fenceLastSignaledValue)))
+                    return WindowModeTransitionStatus::error;
+
+                if (WaitForFence() != WAIT_OBJECT_0)
+                    return WindowModeTransitionStatus::error;
+            }
+
+            currentWindowMode = requestedWindowMode;
+            Log("Changing Window Mode - Finished.\n");
         }
 
-        if (swapChainOccluded && swapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)
-        {
-            // The windw is entirely occluded skip the rendering.
-            Sleep(10);
-            return true;
-        }
-        swapChainOccluded = false;
+        return WindowModeTransitionStatus::completed;
+    }
 
-        // wait for the rendering completion for the current backbuffer index.
+    virtual void Render(HWND, ComPtr<ID3D12GraphicsCommandList>&) = 0;
+
+    // This will be launched in present worker thread.
+    void Present(HWND hWnd, std::atomic<bool>& returnStatus)
+    {
+        returnStatus.store(false);
+
+        if (!dev)
+            return;
+
+        // Wait for the rendering completion for the current backbuffer index.
         {
             uint64_t cmpValue = fence->GetCompletedValue();
             if (fenceLastSignaledValue - cmpValue >= NUM_BACK_BUFFERS) {
-                BOOL sts = ResetEvent(fenceEvent);
-                assert(sts);
-                HRESULT hr = fence->SetEventOnCompletion(fenceLastSignaledValue - (NUM_BACK_BUFFERS - 1), fenceEvent);
-                assert(SUCCEEDED(hr));
+                bool leavingPresentBarrier = false;
                 for (;;) {
-                    DWORD dwSts = WaitForSingleObject(fenceEvent, 2000); // 2sec..
-                    if (dwSts == WAIT_OBJECT_0) {
+                    // Wait up to 2sec to detect present timeout.
+                    auto sts = WaitForFence(leavingPresentBarrier, NUM_BACK_BUFFERS - 1, 2000);
+                    if (sts == WAIT_OBJECT_0) {
                         break;
                     }
-                    if (dwSts != WAIT_TIMEOUT) {
+                    if (sts != WAIT_TIMEOUT) {
                         Log(L"An error detected while waiting for a fence.\n");
-                        return false;
+                        return;
                     }
                     Log(L"Present lock detected. Waited for more than 2 seconds.");
-#ifdef NVAPI_ENABLED
-                    if (nvapi_PresentBarrierHasJoined) {
-                        std::scoped_lock<std::mutex> l{ app->mtx };
-                        if (NvAPI_LeavePresentBarrier(nvapi_PresentBarrierClientHandle) != NVAPI_OK) {
-                            Log("Failed to leave from the Present Barrier.\n");
-                        }
-                        nvapi_PresentBarrierHasJoined = false;
-                    }
-#endif
+                    leavingPresentBarrier = true;
                 }
             }
+        }
+
+        // Updating occlusion status.
+        if (swapChainOccluded && swapChain->Present(0, DXGI_PRESENT_TEST) != DXGI_STATUS_OCCLUDED)
+        {
+            swapChainOccluded = false;
         }
 
         UINT backbufferIdx = swapChain->GetCurrentBackBufferIndex();
@@ -1099,6 +1116,7 @@ public:
         }
 
         {
+            RECT rc{0, 0, (LONG)currentSwapchainSize[0], (LONG)currentSwapchainSize[1]};
             D3D12_VIEWPORT vp{0, 0, (float)rc.right, (float)rc.bottom, 0, 1.f};
             cList->RSSetViewports(1, &vp);
             cList->RSSetScissorRects(1, &rc);
@@ -1116,28 +1134,40 @@ public:
             queue->ExecuteCommandLists(1, cListList);
         }
 
-        // Present
         {
             HRESULT hr = swapChain->Present(1, 0);
+#if 0
+            {
+                // emurate present lock.
+                static uint32_t i;
+                if (++i % 512 == 511) {
+                    Sleep(5000);
+                }
+
+            }
+#endif
             swapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
-            assert(SUCCEEDED(hr));
+            if (FAILED(hr)) {
+                Log("Present call failed with: %d.\n", hr);
+                return;
+            }
         }
 
-        // set fence.
-        {
-            HRESULT hr = queue->Signal(fence.Get(), ++fenceLastSignaledValue);
-            assert(SUCCEEDED(hr));
+        if (FAILED(queue->Signal(fence.Get(), ++fenceLastSignaledValue))) {
+            Log("Setting a signal after Present call failed.\n");
+            return;
         }
 
-        return true;
+        returnStatus.store(true);
+        return;
     }
 
     bool Terminate()
     {
-        if (!WaitForLastPresent())
+        if (WaitForFence() != WAIT_OBJECT_0)
             return false;
 
-        // revert to windowed before releasing a swapchain.
+        // Revert to windowed before releasing the swapchain.
         if (swapChain) {
             if (!FullScreenStateTransition(FALSE))
                 return false;
@@ -1216,7 +1246,7 @@ protected:
     std::deque<std::tuple<int, int>> descHeapFreeIndices;
     bool imInitialized{ false };
 
-public:       
+public:
     bool Init_ImGui(HWND hWnd)
     {
         // Setup Dear ImGui context
@@ -1313,7 +1343,7 @@ public:
         if (!imInitialized)
             return true;
 
-        if (!WaitForLastPresent())
+        if (WaitForFence() != WAIT_OBJECT_0)
             return false;
 
         ImGui_ImplDX12_Shutdown();
@@ -1347,16 +1377,55 @@ public:
 class Window_Base
 {
 protected:
-    HINSTANCE hInst{};
-    HWND hWnd{};
     std::thread thd{};
-    std::binary_semaphore semaphore{ 0 };
-    bool joinable{ false };
-    std::array<LONG_PTR, 2> defaultWindowStyle{0, 0};
+    enum class ThreadState : uint32_t {
+        Initializing,
+        Running,
+        Terminated,
+    };
+    std::atomic<ThreadState>    thdState{ ThreadState::Initializing };
 
     virtual const std::wstring_view& WindowClassName() = 0;
     virtual ATOM& WindowClass() = 0;
     virtual D3DContext_ImGuiBase *GetD3DContext_ImGuiBase() = 0;
+
+public:
+    class PeekMessageContainer final
+    {
+    public:
+        using PeekMessageFunc = std::function<void(HWND, UINT, WPARAM, LPARAM)>;
+        using PeekMessageHandle = uint32_t;
+        static constexpr PeekMessageHandle InvalidHandle{ 0xFFFFFFFFu };
+
+    private:
+        PeekMessageHandle lastHandle{ 0 };
+        std::list<std::tuple<PeekMessageHandle, PeekMessageFunc>>  funcs;
+
+    public:
+        PeekMessageHandle Register(const std::function<void(HWND, UINT, WPARAM, LPARAM)>& f)
+        {
+            funcs.push_back({ lastHandle, f });
+            return lastHandle++;
+        }
+
+        bool Unregister(const PeekMessageHandle h)
+        {
+            for (auto itr = funcs.begin(); itr != funcs.end(); ++itr) {
+                if (std::get<0>(*itr) == h) {
+                    funcs.erase(itr);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void Call(HWND h, UINT m, WPARAM w, LPARAM l)
+        {
+            for (auto& [handle, func] : funcs) {
+                func(h, m, w, l);
+            }
+        }
+    };
 
 public:
     bool RegisterWindowClass(HINSTANCE hInst)
@@ -1380,12 +1449,11 @@ public:
 
     static LRESULT __stdcall WndProc(HWND arg_hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
-        {
-            D3DContext_ImGuiBase* d3dctx = reinterpret_cast<D3DContext_ImGuiBase*>(GetWindowLongPtr(arg_hWnd, GWLP_USERDATA));
-            if (d3dctx) {
-                d3dctx->PeekWindowMessage(arg_hWnd, message, wParam, lParam);
-            }
+        PeekMessageContainer *container = reinterpret_cast<PeekMessageContainer *>(GetWindowLongPtr(arg_hWnd, GWLP_USERDATA));
+        if (container != nullptr) {
+            container->Call(arg_hWnd, message, wParam, lParam);
         }
+
         if (message == WM_NCCREATE) {
             SetWindowLongPtrW(arg_hWnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCT*)lParam)->lpCreateParams);
         }
@@ -1400,7 +1468,6 @@ public:
         }
         break;
         case WM_CLOSE:
-            SetWindowLongPtrW(arg_hWnd, GWLP_USERDATA, 0);
             DestroyWindow(arg_hWnd);
             break;
         case WM_DESTROY:
@@ -1412,115 +1479,260 @@ public:
         return 0;
     }
 
-    bool Init(HINSTANCE hInstance, std::shared_ptr<App>& inApp, const uint32_t listIdx, const bool withImGui)
+    bool Init(HINSTANCE hInst, std::shared_ptr<App>& inApp, const uint32_t listIdx, const bool withImGui)
     {
-        hInst = hInstance;
-
-        if (!RegisterWindowClass(hInstance)) {
+        if (!RegisterWindowClass(hInst)) {
             Log(L"Failed to regiser window class.");
             return false;
         }
 
-        thd = std::thread([this, hInstance, inApp, listIdx, withImGui]() -> int
+        class ScopeGuard final {
+            std::function<void()>   f;
+        public:
+            ScopeGuard(std::function<void()> inF) {
+                f = inF;
+            }
+            ~ScopeGuard() {
+                f();
+            }
+        };
+
+        // Window thread.
+        thd = std::thread([this, hInst, inApp, listIdx, withImGui]() -> void {
+            // Make sure to change the thread state to Terminate whenever exitting from this scope.
+            ScopeGuard threadGuard([this] { thdState.store(ThreadState::Terminated); });
+            std::wstring wname;
             {
-                std::string name;
-                std::wstring wname;
-                {
-                    std::scoped_lock<std::mutex> l{ inApp->mtx };
-                    name = inApp->ctx.displays.at(listIdx).description;
-                    wname = ToUTF16(name);
-                }
-                Log(L"Thread:%s - Start\n", wname.c_str());
+                std::scoped_lock<std::mutex> l{ inApp->mtx };
+                wname = ToUTF16(inApp->ctx.displays.at(listIdx).description);
+            }
+            Log(L"Thread:%s - Start\n", wname.c_str());
 
-                // naming the thread.
-                if (FAILED(SetThreadDescription(GetCurrentThread(), wname.c_str())))
-                {
-                    Log(L"Failed to set the thread name.");
-                    return 0;
-                }
+            // naming the thread.
+            if (FAILED(SetThreadDescription(GetCurrentThread(), wname.c_str())))
+            {
+                Log(L"Failed to set the thread name.");
+                return;
+            }
 
-                // Create message pump for this thread.
+            // Create message pump for this thread.
+            {
                 MSG msg;
                 PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
+            }
+
+            HWND hWnd{};
+            PeekMessageContainer peekMsgContainer;
+            // Guard scope to make sure to destroy the Window.
+            {
+                // Make sure DestroyWindow() is called when exit from this scope.
+                ScopeGuard wndGuard([&hWnd] { if (hWnd != 0) DestroyWindow(hWnd); });
+
+                // Register PeekMessageCallback to clear hWnd when WM_DESTROY received.
+                peekMsgContainer.Register([&hWnd](HWND h, UINT m, WPARAM w, LPARAM l) {
+                    if (m == WM_DESTROY)
+                        hWnd = 0;
+                    });
 
                 // This is a pointer, but it points a member's instance.
-                D3DContext_ImGuiBase *d3dctx = GetD3DContext_ImGuiBase();
+                D3DContext_ImGuiBase* d3dctx = GetD3DContext_ImGuiBase();
 
                 // Set the app and associated output.
                 d3dctx->SetApp(inApp, listIdx);
 
+                // Register PeekMessageCallbacks to peek messages in d3dctx.
+                peekMsgContainer.Register([d3dctx](HWND h, UINT m, WPARAM w, LPARAM l) {
+                    d3dctx->PeekWindowMessage(h, m, w, l);
+                    });
+
                 hWnd = CreateWindowExW(0, WindowClassName().data(), wname.c_str(),
                     WS_OVERLAPPEDWINDOW,
-                    CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, (void*)d3dctx);
+                    CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInst, (void*)&peekMsgContainer);
                 if (!hWnd)
                 {
                     Log(L"Failed to create a window.");
-                    return 0;
+                    return;
                 }
-                defaultWindowStyle = { GetWindowLongPtrW(hWnd, GWL_STYLE), GetWindowLongPtrW(hWnd, GWL_EXSTYLE) };
+
+                // Style and StyleEx
+                std::tuple<LONG_PTR, LONG_PTR> defaultWindowStyle{ GetWindowLongPtrW(hWnd, GWL_STYLE), GetWindowLongPtrW(hWnd, GWL_EXSTYLE) };
 
                 if (!d3dctx->CreateDeviceResources()) {
                     Log(L"Failed to initialize D3D device.");
-                    return 0;
+                    return;
                 }
+
                 if (withImGui) {
                     if (!d3dctx->Init_ImGui(hWnd)) {
                         Log(L"Failed to initialize ImGUI.");
-                        return 0;
+                        return;
                     }
                 }
 
                 if (!d3dctx->ShowWindowOnTheAssociatedOutput(hWnd)) {
                     Log(L"Failed to show window.");
-                    return 0;
+                    return;
                 }
 
-                // Release the semaphore. Unblocking the main thread.
-                semaphore.release();
+                // Change the thread state. Unblocking the caller thread.
+                thdState.store(ThreadState::Running);
 
-                // Main Loop for the window.
-                bool rcvQuitMsg{ false };
-                for (;;)
-                {
+                // Present thread.
+                struct PresentThreadContext final {
+                    std::binary_semaphore       startSemaphore{ 0 };
+                    std::binary_semaphore       finishSemaphore{ 0 };
+                    std::atomic<bool>           exitReq{ false };
+                    std::atomic<bool>           sts{ true };
+                    bool                        busy{ false };
+                    std::thread                 thd;
+                    std::chrono::high_resolution_clock::time_point lastPresent{};
+
+                    void WMClose()
+                    {
+                        if (!thd.joinable())
+                            return;
+
+                        // Try to join the render thread before closing the window.
+                        exitReq.store(true);
+                        startSemaphore.release();
+                        if (finishSemaphore.try_acquire_for(std::chrono::seconds(3))) {
+                            thd.join();
+                            if (!sts) {
+                                Log(L"Present thread returned false after receiving WM_CLOSE\n");
+                            }
+                        }
+                        else {
+                            // Present thread timeout. Present blocked?
+                            Log(L"Present thread blocked for 3 seconds after receiving WM_CLOSE. Aborting anyway.\n");
+                            thd.detach(); // leave the thread as is. 
+                        }
+                    }
+
+                    void CheckFinishStatus()
+                    {
+                        if (!busy)
+                            return;
+                        if (!thd.joinable())
+                            return;
+
+                        if (!finishSemaphore.try_acquire())
+                            return;
+
+                        // update the last present time.
+                        lastPresent = std::chrono::high_resolution_clock::now();
+                        busy = false;
+                    }
+                } presentCtx;
+                presentCtx.thd = std::thread([&]() {
+                    SetThreadDescription(GetCurrentThread(), L"Present Thread");
+                    for (;;) {
+                        presentCtx.startSemaphore.acquire();
+                        if (presentCtx.exitReq.load()) {
+                            presentCtx.finishSemaphore.release();
+                            break;
+                        }
+                        d3dctx->Present(hWnd, presentCtx.sts);
+                        presentCtx.finishSemaphore.release();
+                        if (presentCtx.exitReq.load()) {
+                            break;
+                        }
+                    }
+                    });
+                // Register peek message callback to join the Present thread when receiving WM_CLOSE message.
+                peekMsgContainer.Register([&presentCtx](HWND h, UINT m, WPARAM w, LPARAM l) {
+                    if (m == WM_CLOSE) {
+                        presentCtx.WMClose();
+                    }
+                    });
+
+                // Main Loop for the Window.
+                for (;;) {
                     MSG msg;
                     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
                     {
+                        if (msg.message == WM_QUIT)
+                            break;
+                        // App side PeekMessage should be done in the WndProc function.
+                        // Windows processes multiple message at once in DispatchMessage so that here is not a good place to peek all messages.
                         TranslateMessage(&msg);
                         DispatchMessageW(&msg);
-                        if (msg.message == WM_QUIT)
-                            rcvQuitMsg = true;
                     }
-                    if (rcvQuitMsg)
+                    if (msg.message == WM_QUIT)
                         break;
 
-                    if (!d3dctx->Present(hWnd, defaultWindowStyle))
-                        break;
+                    // Try to join the present thread here to catch up the latest status.
+                    presentCtx.CheckFinishStatus();
+
+                    // Wait for 1ms and keep processing the Windows message loop while the Present thread is busy.
+                    if (presentCtx.busy) {
+                        Sleep(1);
+                        continue;
+                    }
+
+                    if (!presentCtx.sts) {
+                        Log(L"Present thread returned with an error.\n");
+                        return;
+                    }
+
+                    // Window mode transition happens in the message loop thread while the Present thread is joined.
+                    {
+                        auto sts = d3dctx->WindowModeTransition(hWnd, defaultWindowStyle);
+                        if (sts == D3DContext_Base::WindowModeTransitionStatus::error)
+                        {
+                            Log(L"Window mode transition failed.\n");
+                            return;
+                        }
+                        if (sts == D3DContext_Base::WindowModeTransitionStatus::inProgress) {
+                            // Need to get back to the windows message pump once.
+                            continue;
+                        }
+                    }
+
+                    // Check the duration from the last present.
+                    {
+                        float targetDurationMs{};
+                        {
+                            std::scoped_lock<std::mutex> l{ inApp->mtx };
+                            targetDurationMs = inApp->ctx.displays.at(listIdx).threadWaitMs;
+                        }
+                        std::chrono::duration<float, std::milli> elapsedMs = std::chrono::high_resolution_clock::now() - presentCtx.lastPresent;
+
+                        // Elapsed time is not reached to the target duration.
+                        if (elapsedMs.count() < targetDurationMs)
+                            continue;
+                    }
+
+                    // Invoking Present here.
+                    presentCtx.busy = true;
+                    presentCtx.startSemaphore.release();
                 }
-                if (!rcvQuitMsg) {
-                    Log(L"Exitting the main loop without recieving WM_QUIT message.");
-                    msg.wParam = -1;
+                // End of the main loop for the window.
+
+                if (presentCtx.thd.joinable()) {
+                    Log(L"Failed to??>???.");
+                    return;
                 }
 
                 if (withImGui) {
                     if (!d3dctx->Terminate_ImGui()) {
                         Log(L"Failed to terminate ImGui.");
-                        return 0;
+                        return;
                     }
                 }
                 if (!d3dctx->Terminate()) {
                     Log(L"Failed to terminate D3D device.");
-                    return 0;
+                    return;
                 }
 
-                // Release the semaphore to tell the Window has been finished.
-                semaphore.release();
-
                 Log(L"Thread:%s - Join\n", wname.c_str());
-                return (int)msg.wParam;
-            });
+            } // ScopeGuard.
 
-        // Wait untile the worker thread has been established.
-        semaphore.acquire();
+        });
+
+        // Wait untile the worker thread's window has been established.
+        while (thdState.load() == ThreadState::Initializing) {
+            Sleep(1);
+        }
 
         return true;
     }
@@ -1532,29 +1744,7 @@ public:
 
     bool Joinable()
     {
-        if (!joinable) {
-            if (semaphore.try_acquire())
-                joinable = true;
-        }
-
-        return joinable;
-    }
-
-    bool Terminate()
-    {
-        if (hWnd == 0)
-            return true;
-
-        if (PostMessage(hWnd, WM_CLOSE, 0, 0) == 0) {
-            Log(L"Failed to send WM_CLOSE to worker threads.");
-            return false;
-        }
-        thd.join();
-
-        hInst = 0;
-        hWnd = 0;
-
-        return true;
+        return thdState == ThreadState::Terminated;
     }
 };
 
@@ -1602,7 +1792,7 @@ protected:
                     if (ImGui::Button("Exit")) {
                         app->ctx.mode = App::Context::Mode::exit;
                     }
-
+                    
                     ImGui_AddLogText(logIdx);
 
                     ImGui::End();
@@ -1697,9 +1887,8 @@ protected:
                 std::span<Vertex, 6>  vb(reinterpret_cast<Vertex*>(ptr), 6);
                 assert(size > vb.size_bytes());
 
-                float linePos = 0.3f;
-                float lineWidth = 0.05f;
-
+                constexpr float lineWidth{ 0.05f };
+                float linePos{};
                 {
                     std::scoped_lock<std::mutex> l{ app->mtx };
                     linePos = 1.0f - float(app->ctx.globalCounter % 256) / 128.f;
@@ -1788,7 +1977,7 @@ protected:
                             d.windowMode = WindowMode::windowed;
                         }
 
-                        ImGui::SliderFloat("PresentWait(ms)", &d.presentWaitMs, 0.0f, 1000.0f);
+                        ImGui::SliderFloat("Thread Wait(ms)", &d.threadWaitMs, 0.0f, 1000.0f);
 
 #ifdef NVAPI_ENABLED
                         if (ImGui::Button("Join PresentBarrier")) {
@@ -1829,23 +2018,22 @@ protected:
             {
                 App::Context::Mode  appMode{};
                 WindowMode          wMode{};
-                float               waitMs{};
                 {
                     std::scoped_lock<std::mutex> l{ app->mtx };
 
+                    if (internalWindowModeChange) {
+                        // Window mode change event happened.
+                        app->ctx.displays.at(appListIdx).windowMode = requestedWindowMode;
+                        internalWindowModeChange = false;
+                    }
                     appMode = app->ctx.mode;
-
-                    auto& d = app->ctx.displays.at(appListIdx);
-                    wMode = d.windowMode;
-                    waitMs = d.presentWaitMs;
-
+                    wMode = app->ctx.displays.at(appListIdx).windowMode;
                 }
 
-                if (waitMs > 0.f) {
-                    Sleep((DWORD)waitMs);
+                if (requestedWindowMode == currentWindowMode) {
+                    // Window mode state transition has been completed now so that it can accept the request.
+                    requestedWindowMode = wMode;
                 }
-
-                requestedWindowMode = wMode;
 
                 if (appMode != App::Context::Mode::test) {
                     PostMessageW(hWnd, WM_CLOSE, 0, 0);

@@ -143,9 +143,6 @@
     <ClCompile Include="..\imgui\imgui_widgets.cpp" />
     <ClCompile Include="..\src\PresentBarrierTest.cpp" />
   </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="..\src\PresentBarrierTest.h" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
